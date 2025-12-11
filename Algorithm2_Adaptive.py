@@ -195,47 +195,56 @@ def load_annotations():
     return pd.read_csv(ANNOTATIONS_CSV)
 
 
-def get_gt_boxes(df, filename, crop_offset):
+def get_gt_points(df, filename, crop_offset, img_h):
     base = os.path.basename(filename)
     sub = df[df[FILENAME_COL] == base]
 
-    boxes = []
-    for _, row in sub.iterrows():
-        x = row[X_COL]
-        y = row[Y_COL] - crop_offset   # shift after crop
-        w = row[W_COL]
-        h = row[H_COL]
+    if sub.empty:
+        return np.zeros((0, 2), dtype=np.float32)
 
-        if y + h >= 0:
-            boxes.append((x, y, w, h))
+    cx = sub[X_COL].values + sub[W_COL].values / 2
+    cy = sub[Y_COL].values + sub[H_COL].values / 2
 
-    return boxes
+    cy -= crop_offset
+    return np.array([(x, y) for x, y in zip(cx, cy) if y >= 0], dtype=np.float32)
 
 
-# -------- NEW BOX MATCHING ACCURACY --------
+# 9. MATCHING ACCURACY, True Positves, False Positives, False Negatives
 
-def point_in_box(px, py, x, y, w, h):
-    return (x <= px <= x + w) and (y <= py <= y + h)
+def matching_stats(pred, true, max_dist=20):
+    if len(true) == 0:
+        # define TP/FP/FN sensibly in the empty-GT case
+        TP = 0
+        FP = len(pred)
+        FN = 0
+        acc = 1.0 if len(pred) == 0 else 0.0
+        return acc, TP, FP, FN, []
 
-
-def box_accuracy(pred_pts, gt_boxes):
-    if len(gt_boxes) == 0:
-        return 1.0 if len(pred_pts) == 0 else 0.0
-
-    matched = 0
     used = set()
+    matches = []
 
-    for px, py in pred_pts:
-        for i, (x, y, w, h) in enumerate(gt_boxes):
+    for j, (px, py) in enumerate(pred):
+        best = None
+        best_d = 99999
+
+        for i, (tx, ty) in enumerate(true):
             if i in used:
                 continue
-            if point_in_box(px, py, x, y, w, h):
-                matched += 1
-                used.add(i)
-                break
+            d = np.hypot(px - tx, py - ty)
+            if d < best_d:
+                best_d = d
+                best = i
 
-    return matched / len(gt_boxes)
+        if best_d <= max_dist:
+            matches.append((j, best))  # pred j matched GT best
+            used.add(best)
 
+    TP = len(matches)
+    FN = len(true) - TP
+    FP = len(pred) - TP
+    acc = TP / (TP + FN)
+
+    return acc, TP, FP, FN, matches
 
 # 10. MAIN PIPELINE
 
@@ -250,6 +259,9 @@ def main():
     actual_counts = []
     all_acc = []
     all_mse = []
+    all_tp = []
+    all_fp = []
+    all_fn = []
 
     debug_count = 0
 
@@ -291,18 +303,26 @@ def main():
 
             pred_pts, stats, cent = extract_people(fg, dense=False)
 
-        gt_boxes = get_gt_boxes(df, path, crop_offset)
+        true_pts = get_gt_points(df, path, crop_offset, img.shape[0])
 
         pred_count = len(pred_pts)
-        true_count = len(gt_boxes)
+        true_count = len(true_pts)
 
         predicted_counts.append(pred_count)
         actual_counts.append(true_count)
 
         mse = (pred_count - true_count) ** 2
-        acc = box_accuracy(pred_pts, gt_boxes)
+        acc, TP, FP, FN, matches = matching_stats(
+            pred_pts,
+            true_pts,
+            max_dist=20  # or whatever radius you settled on
+        )
+
         all_mse.append(mse)
         all_acc.append(acc)
+        all_tp.append(TP)
+        all_fp.append(FP)
+        all_fn.append(FN)
 
         # DEBUG VISUALIZATION
         if SHOW_DEBUG and debug_count < MAX_DEBUG:
@@ -311,11 +331,9 @@ def main():
             vis = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
 
             for (cx, cy) in pred_pts:
-                cv2.circle(vis, (int(cx), int(cy)), 5, (0,255,0), -1)
-
-            for (x,y,w,h) in gt_boxes:
-                cv2.rectangle(vis, (int(x),int(y)),
-                              (int(x+w),int(y+h)), (255,0,0), 2)
+                cv2.circle(vis, (int(cx), int(cy)), 5, (0, 255, 0), -1)
+            for (tx, ty) in true_pts:
+                cv2.circle(vis, (int(tx), int(ty)), 5, (255, 0, 0), -1)
 
             plt.figure(figsize=(14, 6))
 
@@ -377,6 +395,9 @@ def main():
     print("\n========= FINAL RESULTS (DUAL MODE) =========")
     print(f"Mean Accuracy: {np.mean(all_acc) * 100:.2f}%")
     print(f"Mean MSE: {np.mean(all_mse):.2f}")
+    print(f"Mean TP per image: {np.mean(all_tp):.2f}")
+    print(f"Mean FP per image: {np.mean(all_fp):.2f}")
+    print(f"Mean FN per image: {np.mean(all_fn):.2f}")
     print("=============================================\n")
 
 
