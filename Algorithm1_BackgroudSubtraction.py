@@ -144,20 +144,17 @@ def extract_people(mask):
         x, y, w, h_box, area = stats[i]
         cx, cy = centroids[i]
 
-        # -------- 1) Loosened area thresholds --------
         min_a, max_a = expected_person_area(cy, h)
-        min_a *= 0.5     # allow smaller
-        max_a *= 1.5     # allow larger
+        min_a *= 0.5
+        max_a *= 1.5
 
         if not (min_a <= area <= max_a):
             continue
 
-        # -------- 2) Relaxed shape ratio filter --------
         ratio = w / float(h_box + 1e-5)
         if ratio < 0.15 or ratio > 6.0:
             continue
 
-        # -------- 3) Reduced minimum blob size --------
         if w < 2 or h_box < 2:
             continue
 
@@ -166,51 +163,54 @@ def extract_people(mask):
     return pts, stats, centroids
 
 
-
 # 8. LOAD ANNOTATIONS
 
 def load_annotations():
     return pd.read_csv(ANNOTATIONS_CSV)
 
 
-def get_gt_points(df, filename, crop_offset, img_h):
+# NEW: Load ground-truth boxes instead of center points
+def get_gt_boxes(df, filename, crop_offset):
     base = os.path.basename(filename)
     sub = df[df[FILENAME_COL] == base]
 
-    if sub.empty:
-        return np.zeros((0, 2), dtype=np.float32)
+    boxes = []
+    for _, row in sub.iterrows():
+        x = row[X_COL]
+        y = row[Y_COL] - crop_offset
+        w = row[W_COL]
+        h = row[H_COL]
 
-    cx = sub[X_COL].values + sub[W_COL].values / 2
-    cy = sub[Y_COL].values + sub[H_COL].values / 2
+        if y + h >= 0:  # still visible
+            boxes.append((x, y, w, h))
 
-    cy -= crop_offset
-    return np.array([(x, y) for x, y in zip(cx, cy) if y >= 0], dtype=np.float32)
+    return boxes
 
 
-# 9. MATCHING ACCURACY
+# NEW: Point-in-box helper
+def point_in_box(px, py, x, y, w, h):
+    return (x <= px <= x + w) and (y <= py <= y + h)
 
-def matching_accuracy(pred, true, max_dist=20):
-    if len(true) == 0:
-        return 1.0 if len(pred) == 0 else 0.0
 
+# NEW: Box-based accuracy
+def box_accuracy(pred_pts, true_boxes):
+    if len(true_boxes) == 0:
+        return 1.0 if len(pred_pts) == 0 else 0.0
+
+    matched = 0
     used = set()
-    match = 0
 
-    for px, py in pred:
-        best = None
-        best_d = 99999
-        for i, (tx, ty) in enumerate(true):
+    for px, py in pred_pts:
+        for i, (x, y, w, h) in enumerate(true_boxes):
             if i in used:
                 continue
-            d = np.hypot(px - tx, py - ty)
-            if d < best_d:
-                best_d = d
-                best = i
-        if best_d <= max_dist:
-            match += 1
-            used.add(best)
+            if point_in_box(px, py, x, y, w, h):
+                matched += 1
+                used.add(i)
+                break
 
-    return match / len(true)
+    return matched / len(true_boxes)
+
 
 
 # 10. MAIN — FULL PIPELINE + ALL PLOTS
@@ -222,7 +222,6 @@ def main():
 
     df = load_annotations()
 
-    # For final plots
     predicted_counts = []
     actual_counts = []
     all_acc = []
@@ -230,13 +229,11 @@ def main():
 
     debug_count = 0
 
-    # PROCESS EACH IMAGE
 
     for img_f32, path in zip(imgs, paths):
         img = img_f32.astype(np.uint8)
         cropped, crop_offset = crop(img)
 
-        # Pipeline
         fg = get_foreground_mask(cropped, background_cropped)
         fg = clean_mask(fg)
         fg2, umb = remove_umbrellas(fg, cropped)
@@ -244,29 +241,30 @@ def main():
         fg4, water_line = suppress_water(fg3)
 
         pred_pts, _, _ = extract_people(fg4)
-        true_pts = get_gt_points(df, path, crop_offset, img.shape[0])
+        gt_boxes = get_gt_boxes(df, path, crop_offset)
 
         pred_count = len(pred_pts)
-        true_count = len(true_pts)
+        true_count = len(gt_boxes)
 
         predicted_counts.append(pred_count)
         actual_counts.append(true_count)
 
         mse = (pred_count - true_count)**2
-        acc = matching_accuracy(pred_pts, true_pts)
+        acc = box_accuracy(pred_pts, gt_boxes)
 
         all_mse.append(mse)
         all_acc.append(acc)
 
-        # DEBUG VISUALIZATION
         if SHOW_DEBUG and debug_count < MAX_DEBUG:
             debug_count += 1
 
             vis = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             for (cx, cy) in pred_pts:
                 cv2.circle(vis, (int(cx), int(cy)), 5, (0,255,0), -1)
-            for (tx, ty) in true_pts:
-                cv2.circle(vis, (int(tx), int(ty)), 5, (255,0,0), -1)
+
+            for (x, y, w, h) in gt_boxes:
+                cv2.rectangle(vis, (int(x), int(y)),
+                              (int(x+w), int(y+h)), (255,0,0), 2)
 
             plt.figure(figsize=(14,6))
 
@@ -283,6 +281,7 @@ def main():
 
             plt.show()
 
+
     # PLOT 1 — LINE PLOT: Predicted vs Actual per image
     plt.figure(figsize=(10,6))
     x = np.arange(len(predicted_counts))
@@ -296,8 +295,8 @@ def main():
     plt.savefig("pred_vs_gt.png")
     plt.show()
 
-    # PLOT 2 — SCATTER: Predicted vs Actual
 
+    # PLOT 2 — SCATTER: Predicted vs Actual
     plt.figure(figsize=(6,6))
     plt.scatter(actual_counts, predicted_counts)
     max_val = max(max(actual_counts), max(predicted_counts)) + 5
@@ -310,8 +309,8 @@ def main():
     plt.savefig("pred_vs_gt_scatter.png")
     plt.show()
 
-    # PLOT 3 — BAR PLOT: Predicted vs Actual per image
 
+    # PLOT 3 — BAR PLOT: Predicted vs Actual per image
     plt.figure(figsize=(12,6))
     width = 0.35
     x = np.arange(len(predicted_counts))
@@ -328,7 +327,6 @@ def main():
     plt.savefig("pred_vs_gt_barplot.png")
     plt.show()
 
-    # FINAL METRICS
 
     print("\n========= FINAL RESULTS =========")
     print(f"Mean Accuracy: {np.mean(all_acc)*100:.2f}%")

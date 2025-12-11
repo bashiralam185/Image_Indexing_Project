@@ -36,8 +36,8 @@ SHOW_DEBUG = True
 MAX_DEBUG = 10
 
 # Scene classification
-PREVIEW_AREA_MIN = 100       # minimum CC area to be considered a "blob"
-DENSE_BLOB_THRESHOLD = 10    # >= 10 blobs => dense scene
+PREVIEW_AREA_MIN = 100
+DENSE_BLOB_THRESHOLD = 10
 
 
 # 1. LOAD IMAGES + BACKGROUND
@@ -99,7 +99,7 @@ def clean_mask(mask, ksize=5):
     return mask
 
 
-# 5. DENSE-MODE FILTERS (sand, umbrellas, texture, water)
+# 5. DENSE-MODE FILTERS
 
 def remove_sand(mask, img_bgr):
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -139,7 +139,6 @@ def suppress_water(mask):
 def expected_person_area(y, img_h, dense=True):
     norm = y / float(img_h)
     if dense:
-        # More permissive in dense mode
         if norm < 0.33:
             return 40, 600
         elif norm < 0.66:
@@ -147,7 +146,6 @@ def expected_person_area(y, img_h, dense=True):
         else:
             return 200, 10000
     else:
-        # Stricter in sparse mode (avoid noise)
         if norm < 0.33:
             return 60, 600
         elif norm < 0.66:
@@ -174,14 +172,12 @@ def extract_people(mask, dense=True):
         ratio = w / float(h_box + 1e-5)
 
         if dense:
-            # allow broader shapes in dense mode
             if ratio < 0.25 or ratio > 3.0:
                 continue
             solidity = area / float(w * h_box + 1e-5)
             if solidity < 0.15:
                 continue
         else:
-            # sparse mode: very strict filters
             if ratio < 0.4 or ratio > 2.5:
                 continue
             solidity = area / float(w * h_box + 1e-5)
@@ -193,51 +189,55 @@ def extract_people(mask, dense=True):
     return pts, stats, centroids
 
 
-# 8. ANNOTATIONS
+# 8. ANNOTATIONS (UPDATED FOR BOXES)
 
 def load_annotations():
     return pd.read_csv(ANNOTATIONS_CSV)
 
 
-def get_gt_points(df, filename, crop_offset, img_h):
+def get_gt_boxes(df, filename, crop_offset):
     base = os.path.basename(filename)
     sub = df[df[FILENAME_COL] == base]
 
-    if sub.empty:
-        return np.zeros((0, 2), dtype=np.float32)
+    boxes = []
+    for _, row in sub.iterrows():
+        x = row[X_COL]
+        y = row[Y_COL] - crop_offset   # shift after crop
+        w = row[W_COL]
+        h = row[H_COL]
 
-    cx = sub[X_COL].values + sub[W_COL].values / 2
-    cy = sub[Y_COL].values + sub[H_COL].values / 2 - crop_offset
-    pts = [(x, y) for x, y in zip(cx, cy) if y >= 0]
-    return np.array(pts, dtype=np.float32)
+        if y + h >= 0:
+            boxes.append((x, y, w, h))
+
+    return boxes
 
 
-# 9. MATCHING ACCURACY
+# -------- NEW BOX MATCHING ACCURACY --------
 
-def matching_accuracy(pred, true, max_dist=20):
-    if len(true) == 0:
-        return 1.0 if len(pred) == 0 else 0.0
+def point_in_box(px, py, x, y, w, h):
+    return (x <= px <= x + w) and (y <= py <= y + h)
 
-    used = set()
+
+def box_accuracy(pred_pts, gt_boxes):
+    if len(gt_boxes) == 0:
+        return 1.0 if len(pred_pts) == 0 else 0.0
+
     matched = 0
-    for px, py in pred:
-        best_i = -1
-        best_d = 1e9
-        for i, (tx, ty) in enumerate(true):
+    used = set()
+
+    for px, py in pred_pts:
+        for i, (x, y, w, h) in enumerate(gt_boxes):
             if i in used:
                 continue
-            d = np.hypot(px - tx, py - ty)
-            if d < best_d:
-                best_d = d
-                best_i = i
-        if best_d <= max_dist and best_i >= 0:
-            used.add(best_i)
-            matched += 1
+            if point_in_box(px, py, x, y, w, h):
+                matched += 1
+                used.add(i)
+                break
 
-    return matched / len(true)
+    return matched / len(gt_boxes)
 
 
-# 10. MAIN PIPELINE (DUAL MODE + VISUALS)
+# 10. MAIN PIPELINE
 
 def main():
     imgs, paths = load_images()
@@ -257,13 +257,12 @@ def main():
         img = img_f32.astype(np.uint8)
         cropped, crop_offset = crop(img)
 
-        # Base foreground mask for scene classification
         fg_base, gray = get_foreground_mask_base(cropped, background_cropped)
         fg_preview = clean_mask(fg_base.copy(), ksize=3)
 
         is_dense, big_blobs = classify_scene(fg_preview)
 
-        # ---------------- DENSE MODE ----------------
+        # -------- DENSE MODE --------
         if is_dense:
             mode_str = f"DENSE (blobs={big_blobs})"
             fg = fg_base.copy()
@@ -276,10 +275,9 @@ def main():
 
             pred_pts, stats, cent = extract_people(fg, dense=True)
 
-        # ---------------- SPARSE MODE ----------------
+        # -------- SPARSE MODE --------
         else:
             mode_str = f"SPARSE (blobs={big_blobs})"
-            # Fresh stricter mask
             diff = cv2.absdiff(cropped, background_cropped)
             gray_s = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             fg = cv2.adaptiveThreshold(
@@ -293,27 +291,31 @@ def main():
 
             pred_pts, stats, cent = extract_people(fg, dense=False)
 
-        true_pts = get_gt_points(df, path, crop_offset, img.shape[0])
+        gt_boxes = get_gt_boxes(df, path, crop_offset)
 
         pred_count = len(pred_pts)
-        true_count = len(true_pts)
+        true_count = len(gt_boxes)
 
         predicted_counts.append(pred_count)
         actual_counts.append(true_count)
 
         mse = (pred_count - true_count) ** 2
-        acc = matching_accuracy(pred_pts, true_pts)
+        acc = box_accuracy(pred_pts, gt_boxes)
         all_mse.append(mse)
         all_acc.append(acc)
 
         # DEBUG VISUALIZATION
         if SHOW_DEBUG and debug_count < MAX_DEBUG:
             debug_count += 1
+
             vis = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+
             for (cx, cy) in pred_pts:
-                cv2.circle(vis, (int(cx), int(cy)), 5, (0, 255, 0), -1)
-            for (tx, ty) in true_pts:
-                cv2.circle(vis, (int(tx), int(ty)), 5, (255, 0, 0), -1)
+                cv2.circle(vis, (int(cx), int(cy)), 5, (0,255,0), -1)
+
+            for (x,y,w,h) in gt_boxes:
+                cv2.rectangle(vis, (int(x),int(y)),
+                              (int(x+w),int(y+h)), (255,0,0), 2)
 
             plt.figure(figsize=(14, 6))
 
@@ -331,11 +333,11 @@ def main():
             plt.tight_layout()
             plt.show()
 
-    # PLOTS: LINE, SCATTER, BAR
+    # PLOTS
 
     x = np.arange(len(predicted_counts))
 
-    # Line
+    # Line plot
     plt.figure(figsize=(10, 6))
     plt.plot(x, actual_counts, marker='o', label="Actual")
     plt.plot(x, predicted_counts, marker='x', label="Predicted")
@@ -351,26 +353,24 @@ def main():
     plt.figure(figsize=(6, 6))
     plt.scatter(actual_counts, predicted_counts)
     maxv = max(max(actual_counts), max(predicted_counts)) + 5
-    plt.plot([0, maxv], [0, maxv], 'r--', label="Ideal")
+    plt.plot([0, maxv], [0, maxv], 'r--')
     plt.xlabel("Actual Count")
     plt.ylabel("Predicted Count")
     plt.title("Predicted vs Actual (Scatter)")
     plt.grid(True)
-    plt.legend()
     plt.savefig("pred_vs_gt_scatter.png")
     plt.show()
 
     # Bar
     plt.figure(figsize=(12, 6))
     width = 0.35
-    plt.bar(x - width / 2, actual_counts, width, label="Actual")
-    plt.bar(x + width / 2, predicted_counts, width, label="Predicted")
-    plt.title("Per-image Predicted vs Actual Counts")
+    plt.bar(x - width/2, actual_counts, width)
+    plt.bar(x + width/2, predicted_counts, width)
+    plt.title("Per-image Predicted vs Actual")
     plt.xlabel("Image Index")
-    plt.ylabel("People Count")
+    plt.ylabel("Count")
     plt.xticks(x)
     plt.grid(axis='y')
-    plt.legend()
     plt.savefig("pred_vs_gt_barplot.png")
     plt.show()
 
