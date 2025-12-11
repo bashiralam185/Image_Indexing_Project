@@ -280,9 +280,10 @@ def matching_stats(pred, true, max_dist=20):
     TP = len(matches)
     FN = len(true) - TP
     FP = len(pred) - TP
-    acc = TP / (TP + FN)
+    rec = TP / (TP + FN)
+    prec = TP / (TP + FP)
 
-    return acc, TP, FP, FN, matches
+    return rec, prec, TP, FP, FN, matches
 
 
 def main():
@@ -293,7 +294,8 @@ def main():
     # For final plots
     predicted_counts = []
     actual_counts = []
-    all_acc = []
+    all_rec = []
+    all_prec = []
     all_mse = []
     all_tp = []
     all_fp = []
@@ -358,14 +360,15 @@ def main():
 
         mse = (pred_count - true_count) ** 2
 
-        acc, TP, FP, FN, matches = matching_stats(
+        rec, prec, TP, FP, FN, matches = matching_stats(
             pred_pts,
             true_pts,
             max_dist=20  # or whatever radius you settled on
         )
 
         all_mse.append(mse)
-        all_acc.append(acc)
+        all_rec.append(rec)
+        all_prec.append(prec)
         all_tp.append(TP)
         all_fp.append(FP)
         all_fn.append(FN)
@@ -437,12 +440,13 @@ def main():
     plt.xticks(x)
     plt.legend()
     plt.grid(axis='y')
-    plt.savefig("pred_vs_gt_fft_blobs_barplot.png")
+    plt.savefig("pred_vs_gt_blobs_barplot.png")
     plt.show()
 
     # FINAL METRICS
-    print("\n========= FINAL RESULTS (FFT+Blobs) =========")
-    print(f"Mean Accuracy: {np.mean(all_acc) * 100:.2f}%")
+    print("\n========= FINAL RESULTS (Blobs) =========")
+    print(f"Mean Recall: {np.mean(all_rec) * 100:.2f}%")
+    print(f"Mean Precision: {np.mean(all_prec) * 100:.2f}%")
     print(f"Mean MSE: {np.mean(all_mse):.2f}")
     print(f"Mean TP per image: {np.mean(all_tp):.2f}")
     print(f"Mean FP per image: {np.mean(all_fp):.2f}")
